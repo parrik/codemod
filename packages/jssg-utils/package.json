@@ -14,10 +14,14 @@
     "./xml/*": {
       "types": "./src/xml/exports/*.ts",
       "default": "./src/xml/exports/*.ts"
+    },
+    "./java/*": {
+      "types": "./src/java/exports/*.ts",
+      "default": "./src/java/exports/*.ts"
     }
   },
   "scripts": {
-    "test": "pnpx codemod jssg exec ./tests/imports.test.ts && pnpx codemod jssg exec ./tests/xml.test.ts",
+    "test": "pnpx codemod jssg exec ./tests/imports.test.ts && pnpx codemod jssg exec ./tests/xml.test.ts && pnpx codemod jssg exec ./tests/java-imports.test.ts",
     "check-types": "npx tsc --noEmit",
     "typecheck": "tsc --noEmit"
   },
