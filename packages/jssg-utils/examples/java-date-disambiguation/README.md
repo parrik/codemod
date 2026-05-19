@@ -77,15 +77,16 @@ roots so resolution works.
 
 ## Where this heuristic breaks (`broken/` directory)
 
-Two fixtures the heuristic silently mis-rewrites. Run:
+Two fixtures the heuristic mis-rewrites. The verification script
+`verify/run.sh` compiles every fixture before and after the codemod with
+`javac` and reports the result. The findings below come from running it,
+not from reasoning alone.
 
 ```bash
-npx codemod jssg run ./rename-util-date.ts \
-  --target ./broken \
-  --language java --dry-run --allow-dirty --no-interactive
+bash verify/run.sh
 ```
 
-### `broken/BrokenInnerShadow.java`
+### `broken/BrokenInnerShadow.java` — silent semantic break
 
 ```java
 class BrokenInnerShadow {
@@ -104,12 +105,35 @@ The heuristic produces:
 +        LegacyUtilDate local = new LegacyUtilDate();
 ```
 
-This **does not compile** — `LegacyUtilDate` doesn't exist; the original
-code referred to the local inner class. JLS §6.4.1 says a nested type
-declaration shadows a single-type-import within its scope. Our heuristic
-has no way to see the inner class declaration.
+**The rewritten `BrokenInnerShadow.java` compiles cleanly.** No error, no
+warning. But its semantics changed: `local` was an instance of the inner
+`Date` class (which has a `.label` field); it is now a `LegacyUtilDate`
+(which doesn't). The inner `Date` class is still in the source, now
+orphan dead code.
 
-### `broken/BrokenGenericParam.java`
+The failure surfaces in **downstream consumers**, not in the file the
+codemod touched. `verify/Main.java` accesses `u.local.label` and
+demonstrates this:
+
+```text
+before codemod:  $ java -cp out com.example.Main
+                 local.label = I am the inner Date, not java.util.Date
+
+after codemod:   $ javac com/example/*.java
+                 com/example/Main.java:18: error: cannot find symbol
+                         String s = u.local.label;
+                                           ^
+                   symbol:   variable label
+                   location: variable local of type LegacyUtilDate
+```
+
+The compile error blames `Main.java`. The codemod-touched file looks
+fine. This is the failure mode LST / type-attributed analysis is built
+to prevent: pattern-based rewrites that produce silently-wrong sources
+whose damage only surfaces in callers — sometimes very far from the
+edit.
+
+### `broken/BrokenGenericParam.java` — accidentally correct
 
 ```java
 class BrokenGenericParam {
@@ -122,7 +146,7 @@ class BrokenGenericParam {
 }
 ```
 
-The heuristic produces (truncated):
+The heuristic produces:
 
 ```diff
 -    static class Container<Date> {
@@ -135,10 +159,22 @@ The heuristic produces (truncated):
 +        void put(LegacyUtilDate d) { ... }
 ```
 
-It rewrote the **type parameter declaration itself**, so `Container` now
-declares a type variable named `LegacyUtilDate` rather than parameterizing
-over `LegacyUtilDate`. Structurally meaningless and almost certainly not
-what anyone wanted.
+Surprise: **this compiles and is behaviorally identical to the original**.
+Per JLS §6.4.1, the type parameter declaration `<LegacyUtilDate>` shadows
+the imported class `LegacyUtilDate` inside Container's scope. So every
+`LegacyUtilDate` inside Container refers to the type parameter, not the
+imported class. The class is still generic — callers can do
+`new Container<String>()` exactly as before.
+
+The damage is purely cosmetic: a generic type parameter named after a
+specific class is misleading to readers. Java's name-shadowing rules
+accidentally rescued the heuristic from producing broken code here, even
+though the rewrite was based on faulty reasoning.
+
+This case is a useful pushback against an overcorrection: **pattern-based
+rewrites aren't always wrong on hard-looking inputs.** They're
+*unreliable* — sometimes right by accident, sometimes silently wrong,
+with no signal to distinguish.
 
 ## What an LST/type-attributed visitor would do differently
 
@@ -164,8 +200,10 @@ named `Date` and is there an import line at the top of the file?" So:
   `com.example.BrokenInnerShadow.InnerUser.Date`, **not** `java.util.Date`.
   The visitor skips them.
 - **Generic type parameter**: the type parameter `<Date>` resolves to a
-  type variable, not to `java.util.Date`. The visitor skips it and its
-  uses inside the generic body.
+  type variable, not to `java.util.Date`. The visitor skips it. (As
+  shown above, our heuristic happens to escape harm here too, but for
+  the wrong reasons — Java's shadowing rules cover for the mistake.
+  A type-attributed visitor doesn't need rescuing.)
 - **Same-package shadowing** (not shown here): the symbol resolver
   consults the package's compilation units and picks the same-package
   `Date` over the imported one per JLS rules.
@@ -178,17 +216,20 @@ to set up but can't answer these questions.
 
 ## Summary
 
-| Refactor class                                         | AST + import-helpers | LST / type-attributed |
-| ------------------------------------------------------ | -------------------- | --------------------- |
-| Rename, FQN-only                                       | ✅                   | ✅                    |
-| Rename, single-type-import, no shadowing               | ✅                   | ✅                    |
-| Rename, wildcard import                                | ✅ (via `coversImport`) | ✅                  |
-| Rename when an inner / nested class shadows the import | ❌ (silent wrong)    | ✅                    |
-| Rename when a type parameter shadows the import        | ❌ (silent wrong)    | ✅                    |
-| Rename when a same-package class shadows the import    | ❌ (silent wrong)    | ✅                    |
-| Method-overload-sensitive rewrites                     | ❌                   | ✅                    |
-| Receiver-type-sensitive rewrites                       | ❌                   | ✅                    |
+| Refactor class                                         | AST + import-helpers           | LST / type-attributed |
+| ------------------------------------------------------ | ------------------------------ | --------------------- |
+| Rename, FQN-only                                       | ✅                             | ✅                    |
+| Rename, single-type-import, no shadowing               | ✅                             | ✅                    |
+| Rename, wildcard import                                | ✅ (via `coversImport`)        | ✅                    |
+| Rename when an inner / nested class shadows the import | ❌ silent-semantic-wrong; downstream consumers fail | ✅                    |
+| Rename when a type parameter shadows the import        | ⚠️ accidentally correct; ugly naming, behaviour preserved | ✅                    |
+| Rename when a same-package class shadows the import    | ❌ silent-semantic-wrong       | ✅                    |
+| Method-overload-sensitive rewrites                     | ❌                             | ✅                    |
+| Receiver-type-sensitive rewrites                       | ❌                             | ✅                    |
 
 The import-helpers approach is good enough for disciplined codebases on
-the top 3 rows. The bottom 5 rows are why Java refactoring tools
-historically sit on type-attributed trees.
+the top 3 rows. The bottom rows are why Java refactoring tools
+historically sit on type-attributed trees — not because pattern-based
+rewrites *always* fail on hard inputs, but because they're *unreliable*:
+sometimes silently wrong, sometimes accidentally right, with no signal
+to tell those apart.
