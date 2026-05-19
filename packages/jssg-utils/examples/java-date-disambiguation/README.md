@@ -75,18 +75,120 @@ module resolution fails for both the script entry and its relative import
 of the helpers. The local `tsconfig.json` here re-establishes the include
 roots so resolution works.
 
-## Known limitations (real type-awareness would catch these)
+## Where this heuristic breaks (`broken/` directory)
 
-- **Same-package shadowing.** A class named `Date` in `com.example` would
-  shadow `java.util.Date` with no import line to detect. This transform
-  would still rewrite the bare references — wrong.
-- **Inner / nested classes.** `Foo.Date` is a different `Date` entirely.
-  Pattern `"Date"` matches its identifier portion.
-- **Both imports + bare references.** Java forbids this (compile error),
-  but partial-rewrite tools can produce broken intermediate states.
+Two fixtures the heuristic silently mis-rewrites. Run:
 
-A real Java codemod for unknown user code needs a Java symbol resolver.
-The import-helpers approach is good enough for disciplined codebases (no
-shadowing, no nested-class collisions), which covers most enterprise Java
-in practice — but call it what it is: **heuristic disambiguation**, not
-type-aware analysis.
+```bash
+npx codemod jssg run ./rename-util-date.ts \
+  --target ./broken \
+  --language java --dry-run --allow-dirty --no-interactive
+```
+
+### `broken/BrokenInnerShadow.java`
+
+```java
+class BrokenInnerShadow {
+    Date realUtilDate = new Date();        // really java.util.Date — OK to rewrite
+    static class InnerUser {
+        static class Date { ... }          // shadows the import inside InnerUser
+        Date local = new Date();           // refers to inner class, NOT java.util.Date
+    }
+}
+```
+
+The heuristic produces:
+
+```diff
+-        Date local = new Date();
++        LegacyUtilDate local = new LegacyUtilDate();
+```
+
+This **does not compile** — `LegacyUtilDate` doesn't exist; the original
+code referred to the local inner class. JLS §6.4.1 says a nested type
+declaration shadows a single-type-import within its scope. Our heuristic
+has no way to see the inner class declaration.
+
+### `broken/BrokenGenericParam.java`
+
+```java
+class BrokenGenericParam {
+    Date lastSeen = new Date();             // really java.util.Date — OK to rewrite
+    static class Container<Date> {          // <Date> is a type parameter
+        Date value;                         // refers to the type parameter
+        Date get() { return value; }
+        void put(Date d) { this.value = d; }
+    }
+}
+```
+
+The heuristic produces (truncated):
+
+```diff
+-    static class Container<Date> {
+-        Date value;
+-        Date get() { ... }
+-        void put(Date d) { ... }
++    static class Container<LegacyUtilDate> {
++        LegacyUtilDate value;
++        LegacyUtilDate get() { ... }
++        void put(LegacyUtilDate d) { ... }
+```
+
+It rewrote the **type parameter declaration itself**, so `Container` now
+declares a type variable named `LegacyUtilDate` rather than parameterizing
+over `LegacyUtilDate`. Structurally meaningless and almost certainly not
+what anyone wanted.
+
+## What an LST/type-attributed visitor would do differently
+
+In OpenRewrite (or any tool with a type-attributed AST), every identifier
+node carries its resolved symbol. The visitor for the same refactor would
+look approximately like:
+
+```java
+visitIdentifier(J.Identifier id, ExecutionContext ctx) {
+    JavaType type = id.getType();                              // attribution
+    if (TypeUtils.isOfClassType(type, "java.util.Date")) {
+        return id.withSimpleName("LegacyUtilDate")
+                 .withType(JavaType.buildType("com.example.LegacyUtilDate"));
+    }
+    return id;                                                  // leave alone
+}
+```
+
+This rewrite decision keys off `getType()`, not off "is this identifier
+named `Date` and is there an import line at the top of the file?" So:
+
+- **Inner-class shadowing**: the inner `Date` symbols resolve to
+  `com.example.BrokenInnerShadow.InnerUser.Date`, **not** `java.util.Date`.
+  The visitor skips them.
+- **Generic type parameter**: the type parameter `<Date>` resolves to a
+  type variable, not to `java.util.Date`. The visitor skips it and its
+  uses inside the generic body.
+- **Same-package shadowing** (not shown here): the symbol resolver
+  consults the package's compilation units and picks the same-package
+  `Date` over the imported one per JLS rules.
+- **Method overload selection**: the call site's `getType()` on the
+  receiver disambiguates which overload is being invoked.
+
+The cost: OpenRewrite needs the full classpath (or a fakable one) to
+build the symbol table. JSSG/ast-grep doesn't, which is why it's faster
+to set up but can't answer these questions.
+
+## Summary
+
+| Refactor class                                         | AST + import-helpers | LST / type-attributed |
+| ------------------------------------------------------ | -------------------- | --------------------- |
+| Rename, FQN-only                                       | ✅                   | ✅                    |
+| Rename, single-type-import, no shadowing               | ✅                   | ✅                    |
+| Rename, wildcard import                                | ✅ (via `coversImport`) | ✅                  |
+| Rename when an inner / nested class shadows the import | ❌ (silent wrong)    | ✅                    |
+| Rename when a type parameter shadows the import        | ❌ (silent wrong)    | ✅                    |
+| Rename when a same-package class shadows the import    | ❌ (silent wrong)    | ✅                    |
+| Method-overload-sensitive rewrites                     | ❌                   | ✅                    |
+| Receiver-type-sensitive rewrites                       | ❌                   | ✅                    |
+
+The import-helpers approach is good enough for disciplined codebases on
+the top 3 rows. The bottom 5 rows are why Java refactoring tools
+historically sit on type-attributed trees.
